@@ -1,0 +1,4 @@
+﻿__pycache__/
+*.pyc
+.laporan_situasi_state.json
+.env

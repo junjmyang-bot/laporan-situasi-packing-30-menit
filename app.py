@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import secrets
+import threading
 import uuid
 from html import escape
 from datetime import datetime, timedelta
@@ -11,19 +13,20 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 
-COUNT_KEYS = ["k", "lk", "c", "pk", "gd", "dr", "st"]
+COUNT_KEYS = ["k", "lpk", "cc", "pk", "dr", "st", "lain"]
 TOKEN_RE = re.compile(r"^\s*(\d+)\s*([a-zA-Z]+)\s*$", re.IGNORECASE)
 TOKEN_ALIAS = {
     "k": "k",
-    "lk": "lk",
-    "c": "c",
-    "cc": "c",
+    "lpk": "lpk",
+    "lk": "lpk",
+    "cc": "cc",
+    "c": "cc",
     "pk": "pk",
-    "gd": "gd",
     "dr": "dr",
     "dry": "dr",
     "st": "st",
     "steam": "st",
+    "lain": "lain",
 }
 
 ACTIVITY_GROUP_TEMPLATES = {
@@ -44,12 +47,13 @@ SOURCE_DEPARTMENTS = [
 ]
 
 PERSIST_PATH = Path(".laporan_situasi_state.json")
-STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "tasks_table_", "task_name_", "pic_name_", "pic_role_")
+STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "ord_", "tasks_table_", "task_name_", "pic_name_", "pic_role_", "pic_mode_")
 LOCK_TTL_SECONDS = 600
+STATE_IO_LOCK = threading.RLock()
 TEAM_LABELS = {
-    "PACKING-1": "Packing Team 1",
-    "PACKING-2": "Packing Team 2",
-    "PACKING-3": "Packing Team 3",
+    "PACKING-1": "Team Vivi",
+    "PACKING-2": "Team 2",
+    "PACKING-3": "Team 3",
 }
 TELEGRAM_SOFT_LIMIT = 3200
 
@@ -112,7 +116,10 @@ def pretty_label(text: str) -> str:
 
 
 def load_team_passwords() -> dict[str, str]:
-    # Priority: Streamlit secrets -> TEAM_PASSWORDS_JSON -> per-team env vars.
+    # Priority:
+    # 1) Streamlit secrets [TEAM_PASSWORDS]
+    # 2) TEAM_PASSWORDS_JSON from secrets/env
+    # 3) per-team TEAM_PIN_* from secrets/env
     out: dict[str, str] = {}
     try:
         secret_map = st.secrets.get("TEAM_PASSWORDS", {})
@@ -122,7 +129,13 @@ def load_team_passwords() -> dict[str, str]:
         out = {}
 
     if not out:
-        raw_json = os.getenv("TEAM_PASSWORDS_JSON", "").strip()
+        raw_json = ""
+        try:
+            raw_json = str(st.secrets.get("TEAM_PASSWORDS_JSON", "")).strip()
+        except Exception:
+            raw_json = ""
+        if not raw_json:
+            raw_json = os.getenv("TEAM_PASSWORDS_JSON", "").strip()
         if raw_json:
             try:
                 loaded = json.loads(raw_json)
@@ -134,19 +147,54 @@ def load_team_passwords() -> dict[str, str]:
     if not out:
         for team_id in TEAM_LABELS.keys():
             env_key = f"TEAM_PIN_{team_id.replace('-', '_')}"
-            pin = os.getenv(env_key, "").strip()
+            pin = ""
+            try:
+                pin = str(st.secrets.get(env_key, "")).strip()
+            except Exception:
+                pin = ""
+            if not pin:
+                pin = os.getenv(env_key, "").strip()
             if pin:
                 out[team_id] = pin
+    if not out:
+        # Fallback default for packing app so operations can continue
+        # even when Cloud secrets/env has not been configured yet.
+        out = {
+            "PACKING-1": "3456",
+            "PACKING-2": "qwer",
+            "PACKING-3": "qw34",
+        }
     return out
 
 
-def load_persisted_state() -> dict:
-    if not PERSIST_PATH.exists():
-        return {}
+def get_config_value(key: str, default: str = "") -> str:
+    env_val = os.getenv(key, "").strip()
+    if env_val:
+        return env_val
     try:
-        return json.loads(PERSIST_PATH.read_text(encoding="utf-8"))
+        secret_val = st.secrets.get(key, "")
+        if secret_val is None:
+            return default
+        secret_text = str(secret_val).strip()
+        return secret_text if secret_text else default
     except Exception:
-        return {}
+        return default
+
+
+def load_persisted_state() -> dict:
+    with STATE_IO_LOCK:
+        if not PERSIST_PATH.exists():
+            return {}
+        try:
+            return json.loads(PERSIST_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+
+def _write_state_atomically(raw: dict) -> None:
+    tmp_path = PERSIST_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, PERSIST_PATH)
 
 
 def load_scoped_state(work_date: str, team_id: str) -> dict:
@@ -180,34 +228,35 @@ def save_scoped_state(
     payload: dict,
     expected_version: int | None = None,
 ) -> tuple[bool, int]:
-    raw = load_persisted_state()
-    key = _scope_key(work_date, team_id)
-    scopes = raw.get("scopes")
-    if not isinstance(scopes, dict):
-        scopes = {}
+    with STATE_IO_LOCK:
+        raw = load_persisted_state()
+        key = _scope_key(work_date, team_id)
+        scopes = raw.get("scopes")
+        if not isinstance(scopes, dict):
+            scopes = {}
 
-    existing = scopes.get(key, {})
-    if isinstance(existing, dict) and "data" in existing:
-        current_version = int(existing.get("version", 0))
-        current_lock = existing.get("lock")
-        lock_history = existing.get("lock_history", [])
-    else:
-        current_version = 0
-        current_lock = None
-        lock_history = []
+        existing = scopes.get(key, {})
+        if isinstance(existing, dict) and "data" in existing:
+            current_version = int(existing.get("version", 0))
+            current_lock = existing.get("lock")
+            lock_history = existing.get("lock_history", [])
+        else:
+            current_version = 0
+            current_lock = None
+            lock_history = []
 
-    if expected_version is not None and current_version != expected_version:
-        return False, current_version
+        if expected_version is not None and current_version != expected_version:
+            return False, current_version
 
-    scopes[key] = {
-        "data": payload,
-        "version": current_version + 1,
-        "lock": current_lock,
-        "lock_history": lock_history,
-    }
-    raw["scopes"] = scopes
-    PERSIST_PATH.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    return True, current_version + 1
+        scopes[key] = {
+            "data": payload,
+            "version": current_version + 1,
+            "lock": current_lock,
+            "lock_history": lock_history,
+        }
+        raw["scopes"] = scopes
+        _write_state_atomically(raw)
+        return True, current_version + 1
 
 
 def build_persist_payload() -> dict:
@@ -250,10 +299,13 @@ def persist_state_to_disk() -> None:
     try:
         expected = st.session_state.get("scope_version")
         ok, new_version = save_scoped_state(work_date, team_id, build_persist_payload(), expected_version=expected)
-        if ok:
+        if not ok:
+            st.warning("Penyimpanan lokal gagal karena konflik versi. Muat ulang lalu coba lagi.")
             st.session_state["scope_version"] = new_version
-    except Exception:
-        pass
+            return
+        st.session_state["scope_version"] = new_version
+    except Exception as e:
+        st.warning("Penyimpanan lokal gagal: " + str(e))
 
 
 def _lock_is_active(lock: dict | None) -> bool:
@@ -274,47 +326,51 @@ def get_scope_lock(work_date: str, team_id: str) -> dict | None:
 
 
 def acquire_scope_lock(work_date: str, team_id: str, operator: str, force: bool = False) -> tuple[bool, str]:
-    raw = load_persisted_state()
-    key = _scope_key(work_date, team_id)
-    scopes = raw.get("scopes")
-    if not isinstance(scopes, dict):
-        scopes = {}
-    rec = get_scope_record(work_date, team_id)
-    lock = rec.get("lock")
-    active = _lock_is_active(lock)
-    token = st.session_state.get("lock_token")
-    if not token:
-        token = str(uuid.uuid4())
-        st.session_state["lock_token"] = token
+    with STATE_IO_LOCK:
+        raw = load_persisted_state()
+        key = _scope_key(work_date, team_id)
+        scopes = raw.get("scopes")
+        if not isinstance(scopes, dict):
+            scopes = {}
+        existing = scopes.get(key, {})
+        if isinstance(existing, dict) and "data" in existing:
+            rec = existing
+        else:
+            rec = {"data": {}, "version": 0, "lock": None, "lock_history": []}
+        lock = rec.get("lock")
+        active = _lock_is_active(lock)
+        token = st.session_state.get("lock_token")
+        if not token:
+            token = str(uuid.uuid4())
+            st.session_state["lock_token"] = token
 
-    if active and not force:
-        same_owner = lock.get("token") == token
-        if not same_owner:
-            return False, f"현재 {lock.get('owner','unknown')} 사용 중"
+        if active and not force:
+            same_owner = lock.get("token") == token
+            if not same_owner:
+                return False, f"Saat ini dipakai oleh {lock.get('owner', 'tidak diketahui')}"
 
-    now = now_iso()
-    new_lock = {
-        "owner": operator,
-        "token": token,
-        "acquired_iso": lock.get("acquired_iso", now) if isinstance(lock, dict) else now,
-        "heartbeat_iso": now,
-    }
-    lock_history = rec.get("lock_history", [])
-    if force:
-        lock_history.append({"action": "takeover", "at": now, "by": operator, "from": (lock or {}).get("owner", "-")})
-    elif not active:
-        lock_history.append({"action": "acquire", "at": now, "by": operator})
+        now = now_iso()
+        new_lock = {
+            "owner": operator,
+            "token": token,
+            "acquired_iso": lock.get("acquired_iso", now) if isinstance(lock, dict) else now,
+            "heartbeat_iso": now,
+        }
+        lock_history = rec.get("lock_history", [])
+        if force:
+            lock_history.append({"action": "takeover", "at": now, "by": operator, "from": (lock or {}).get("owner", "-")})
+        elif not active:
+            lock_history.append({"action": "acquire", "at": now, "by": operator})
 
-    scopes[key] = {
-        "data": rec.get("data", {}),
-        "version": int(rec.get("version", 0)),
-        "lock": new_lock,
-        "lock_history": lock_history,
-    }
-    raw["scopes"] = scopes
-    PERSIST_PATH.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    return True, "잠금 획득 성공"
-
+        scopes[key] = {
+            "data": rec.get("data", {}),
+            "version": int(rec.get("version", 0)),
+            "lock": new_lock,
+            "lock_history": lock_history,
+        }
+        raw["scopes"] = scopes
+        _write_state_atomically(raw)
+        return True, "Kunci berhasil diambil"
 
 def refresh_scope_lock(work_date: str, team_id: str) -> None:
     operator = st.session_state.get("operator_name", "").strip()
@@ -362,8 +418,11 @@ def init_state() -> None:
 
 
 def _hhmm_to_minutes(hhmm: str) -> int:
-    h, m = hhmm.split(":")
-    return int(h) * 60 + int(m)
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return 0
 
 
 def build_slots(start_hhmm: str = "00:00", end_hhmm: str = "23:30") -> list[str]:
@@ -517,7 +576,7 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
 
     lines: list[str] = [
         f"3-{slot_idx}) {report_time}",
-        f"   Total slot: {slot_item['slot_total']} pax",
+        f"   Total waktu laporan: {slot_item['slot_total']} pax",
         f"   Sumber: {sumber_line}",
     ]
 
@@ -553,11 +612,11 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
 
     event_lines = split_note_lines(slot_item.get("event_slot", ""))
     if event_lines and (event_lines != reason_lines):
-        lines.append(f"   Event slot ini: {event_lines[0]}")
+        lines.append(f"   Keterangan tambahan: {event_lines[0]}")
         for extra in event_lines[1:]:
             lines.append(f"                 - {extra}")
 
-    lines.append(f"   Total semua aktivitas slot ini: {slot_item['slot_total']} pax")
+    lines.append(f"   Total semua aktivitas pada waktu laporan ini: {slot_item['slot_total']} pax")
     return lines
 
 
@@ -772,9 +831,9 @@ def build_sheet_row(payload: dict, current_total: int) -> list[str]:
 
 
 def append_sheet_backup(payload: dict, row: list[str]) -> tuple[str, str]:
-    webhook = os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "").strip()
+    webhook = get_config_value("GOOGLE_SHEETS_WEBHOOK_URL", "")
     if not webhook:
-        return "skip", "Sheets backup 비활성(환경변수 미설정)"
+        return "skip", "Sheets backup nonaktif (env/secrets belum diatur)"
     body = json.dumps(
         {
             "idempotency_key": payload.get("idempotency_key"),
@@ -798,13 +857,13 @@ def append_sheet_backup(payload: dict, row: list[str]) -> tuple[str, str]:
                 return "ok", "Sheets backup OK"
             return "error", f"Sheets backup HTTP {getattr(resp, 'status', 'unknown')}"
     except Exception as err:
-        return "error", f"Sheets backup 실패: {err}"
+        return "error", f"Sheets backup gagal: {err}"
 
 
 def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = get_config_value("TELEGRAM_BOT_TOKEN", "")
     if not token:
-        return False, "TELEGRAM_BOT_TOKEN 환경변수가 없습니다.", {}
+        return False, "TELEGRAM_BOT_TOKEN belum diatur di env/secrets.", {}
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = parse.urlencode(payload).encode("utf-8")
     req = request.Request(url, data=data, method="POST")
@@ -814,7 +873,7 @@ def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
             parsed = json.loads(body)
             if parsed.get("ok"):
                 return True, "OK", parsed.get("result", {})
-            return False, f"Telegram 응답 오류: {parsed}", {}
+            return False, f"Galat respons Telegram: {parsed}", {}
     except urlerror.HTTPError as err:
         try:
             body = err.read().decode("utf-8", errors="ignore")
@@ -824,39 +883,45 @@ def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
         except Exception:
             return False, f"Telegram API HTTP {err.code}", {}
     except Exception as err:
-        return False, f"Telegram API 실패: {err}", {}
+        return False, f"Galat API Telegram: {err}", {}
+
+
+def _escape_mdv2(text: str) -> str:
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 
 def send_new_message(message: str) -> tuple[bool, str, int | None]:
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    chat_id = get_config_value("TELEGRAM_CHAT_ID", "")
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID 환경변수가 없습니다.", None
+        return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets.", None
+    message = _escape_mdv2(message)
     ok, msg, data = _telegram_api(
         "sendMessage",
-        {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+        {"chat_id": chat_id, "text": message, "parse_mode": "MarkdownV2"},
     )
     if not ok:
         return False, msg, None
-    return True, "Telegram 신규 메시지 전송 성공", data.get("message_id")
+    return True, "Pesan baru Telegram berhasil dikirim", data.get("message_id")
 
 
 def edit_existing_message(message_id: int, message: str) -> tuple[bool, str]:
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    chat_id = get_config_value("TELEGRAM_CHAT_ID", "")
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID 환경변수가 없습니다."
+        return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets."
+    message = _escape_mdv2(message)
     ok, msg, _ = _telegram_api(
         "editMessageText",
-        {"chat_id": chat_id, "message_id": message_id, "text": message, "parse_mode": "Markdown"},
+        {"chat_id": chat_id, "message_id": message_id, "text": message, "parse_mode": "MarkdownV2"},
     )
     if not ok:
         return False, msg
-    return True, "Telegram 메시지 수정 성공"
+    return True, "Pesan Telegram berhasil diperbarui"
 
 
 def send_update_reply(root_message_id: int) -> tuple[bool, str]:
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    chat_id = get_config_value("TELEGRAM_CHAT_ID", "")
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID 환경변수가 없습니다."
+        return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets."
     ok, msg, _ = _telegram_api(
         "sendMessage",
         {
@@ -867,7 +932,7 @@ def send_update_reply(root_message_id: int) -> tuple[bool, str]:
     )
     if not ok:
         return False, msg
-    return True, "Update reply 전송 성공"
+    return True, "Balasan pembaruan berhasil dikirim"
 
 
 def sync_scope_if_needed(work_date: str, team_id: str) -> None:
@@ -976,37 +1041,37 @@ def main() -> None:
     if open_clicked:
         if not operator_name.strip():
             st.error("Nama operator wajib diisi.")
-        elif team_pin == team_passwords.get(team_id, ""):
+        elif secrets.compare_digest(team_pin, team_passwords.get(team_id, "")):
             ok_lock, msg_lock = acquire_scope_lock(work_date, team_id, operator_name, force=False)
             if ok_lock:
                 st.session_state["authenticated_scope"] = scope
                 st.session_state["team_id"] = team_id
                 st.session_state["work_date"] = work_date
                 st.session_state["operator_name"] = operator_name
-                st.success(f"{team_id} 인증 성공")
+                st.success(f"{team_id} berhasil dibuka")
             else:
-                st.error(f"{msg_lock}. 필요하면 Take Over 사용")
+                st.error(f"{msg_lock}. Jika perlu gunakan Take Over Tim")
         else:
             st.error("PIN Tim tidak valid.")
 
     if takeover_clicked:
         if not operator_name.strip():
             st.error("Nama operator wajib diisi.")
-        elif team_pin == team_passwords.get(team_id, ""):
+        elif secrets.compare_digest(team_pin, team_passwords.get(team_id, "")):
             ok_take, msg_take = acquire_scope_lock(work_date, team_id, operator_name, force=True)
             if ok_take:
                 st.session_state["authenticated_scope"] = scope
                 st.session_state["team_id"] = team_id
                 st.session_state["work_date"] = work_date
                 st.session_state["operator_name"] = operator_name
-                st.success(f"Take Over 성공: {team_id}")
+                st.success(f"Take Over berhasil: {team_id}")
             else:
                 st.error(msg_take)
         else:
             st.error("PIN Tim tidak valid untuk Take Over.")
 
     if st.session_state.get("authenticated_scope") != scope:
-        st.warning(f"{team_id} 데이터를 열려면 PIN을 입력 후 'Buka Tim'을 누르세요.")
+        st.warning(f"Untuk membuka data {team_id}, masukkan PIN lalu tekan 'Buka Tim'.")
         st.stop()
 
     sync_scope_if_needed(work_date, team_id)
@@ -1114,7 +1179,7 @@ def main() -> None:
             )
     source_sum_now = sum(int(source_composition[k]) for k, _ in SOURCE_DEPARTMENTS)
     st.caption(f"Total komposisi sumber: {source_sum_now} pax")
-    st.caption("Singkatan: k=Inbound, lk=Line packing, c=Cuci, pk=Packing, gd=Gudang, dr=Dry, st=Steam. Contoh input: 3k+2pk")
+    st.caption("Singkatan: pk=Packing, lpk=packing laki-laki, k=Kupas, lk=Laki-laki, cc=Cuci, dr=Dry, st=Steam, lain=Lain. Contoh input: 10pk, 2lpk")
     if "manual_groups" not in st.session_state:
         st.session_state["manual_groups"] = []
 
@@ -1149,7 +1214,7 @@ def main() -> None:
 
         with st.expander(f"- {group}", expanded=True):
             st.caption("Flow manual: tambah seperlunya, tanpa default.")
-            pic_c1, pic_c2 = st.columns(2)
+            pic_c1, pic_c2, pic_c3 = st.columns(3)
             with pic_c1:
                 pic_name = st.text_input(
                     "PIC",
@@ -1162,6 +1227,12 @@ def main() -> None:
                     key=f"pic_role_{group_slug}",
                     placeholder="Jabatan PIC",
                 )
+            with pic_c3:
+                pic_mode = st.selectbox(
+                    "Status PIC",
+                    ["Laporan dan kerja", "Laporan tanpa kerja"],
+                    key=f"pic_mode_{group_slug}",
+                )
             group_pic_map[group] = {"name": pic_name, "role": pic_role}
             items = st.session_state[table_key]
             cleaned = []
@@ -1169,7 +1240,16 @@ def main() -> None:
                 if isinstance(item, dict) and item.get("id"):
                     name = str(item.get("tugas", "")).strip()
                     if name and name.lower() not in {"none", "-"}:
-                        cleaned.append({"id": str(item["id"]), "tugas": name})
+                        item_id = str(item["id"])
+                        if item_id == "__pic_report__":
+                            continue
+                        mix_key = f"mix_{group_slug}_{item_id}"
+                        mix_value = str(st.session_state.get(mix_key, item.get("mix", ""))).strip()
+                        cleaned.append({"id": item_id, "tugas": name, "mix": mix_value})
+            pic_task_name = "PIC LAPORAN TANPA KERJA" if pic_mode == "Laporan tanpa kerja" else "PIC LAPORAN DAN KERJA"
+            pic_mix_key = f"mix_{group_slug}___pic_report__"
+            pic_mix_value = str(st.session_state.get(pic_mix_key, "")).strip()
+            cleaned.insert(0, {"id": "__pic_report__", "tugas": pic_task_name, "mix": pic_mix_value})
             st.session_state[table_key] = cleaned
             items = cleaned
 
@@ -1195,35 +1275,45 @@ def main() -> None:
 
             for idx, item in enumerate(items):
                 task_id = item["id"]
-                row_no, row_task, row_mix, row_del = st.columns([0.8, 1.8, 6.0, 1.4])
+                row_no_display = "0" if task_id == "__pic_report__" else str(max(1, idx))
+                row_no, row_task, row_mix, row_del = st.columns([0.7, 4.8, 3.5, 1.2])
                 with row_no:
                     ord_key = f"ord_{group_slug}_{task_id}"
                     if ord_key not in st.session_state:
-                        st.session_state[ord_key] = str(idx + 1)
+                        st.session_state[ord_key] = row_no_display
                     st.text_input(
                         "No",
                         key=ord_key,
                         label_visibility="collapsed",
+                        disabled=(task_id == "__pic_report__"),
                     )
                 with row_task:
                     task_name_key = f"task_name_{group_slug}_{task_id}"
-                    if task_name_key not in st.session_state:
+                    if task_id == "__pic_report__":
+                        st.session_state[task_name_key] = pic_task_name
+                    elif task_name_key not in st.session_state:
                         st.session_state[task_name_key] = item["tugas"]
                     edited_name = st.text_input(
-                        f"Nama tugas {idx + 1}",
+                        f"Nama tugas {row_no_display}",
                         key=task_name_key,
                         label_visibility="collapsed",
+                        disabled=(task_id == "__pic_report__"),
                     ).strip()
-                    item["tugas"] = edited_name
+                    item["tugas"] = pic_task_name if task_id == "__pic_report__" else edited_name
                 with row_mix:
-                    st.text_input(
-                        f"Rincian {idx + 1}",
-                        key=f"mix_{group_slug}_{task_id}",
-                        placeholder="contoh: 3k+2gd",
+                    mix_key = f"mix_{group_slug}_{task_id}"
+                    if mix_key not in st.session_state and str(item.get("mix", "")).strip():
+                        st.session_state[mix_key] = str(item.get("mix", "")).strip()
+                    mix_value = st.text_input(
+                        f"Rincian {row_no_display}",
+                        key=mix_key,
+                        placeholder=("contoh: 1k / 1pk / 2dr" if task_id == "__pic_report__" else "contoh: 10pk, 2lpk"),
                         label_visibility="collapsed",
+                        disabled=False,
                     )
+                    item["mix"] = str(mix_value).strip()
                 with row_del:
-                    if st.button("Hapus", key=f"del_{group_slug}_{task_id}", type="secondary"):
+                    if task_id != "__pic_report__" and st.button("Hapus", key=f"del_{group_slug}_{task_id}", type="secondary"):
                         st.session_state["confirm_remove_task"] = f"{group_slug}:{task_id}"
                 if st.session_state.get("confirm_remove_task") == f"{group_slug}:{task_id}":
                     st.warning("Hapus baris tugas ini?")
@@ -1251,14 +1341,17 @@ def main() -> None:
                     for i, it in enumerate(items):
                         raw = str(st.session_state.get(f"ord_{group_slug}_{it['id']}", i + 1)).strip()
                         wanted = int(raw) if raw.isdigit() else (i + 1)
-                        wanted = max(1, min(wanted, max(1, total_len)))
+                        wanted = max(0, min(wanted, max(1, total_len)))
                         ranked.append((wanted, i, it))
                     ranked.sort(key=lambda x: (x[0], x[1]))
+                    ranked = sorted(ranked, key=lambda x: (0 if x[2]["id"] == "__pic_report__" else 1, x[0], x[1]))
                     st.session_state[table_key] = [x[2] for x in ranked]
                     st.rerun()
             block_total = 0
             for it in items:
-                mix_raw = str(st.session_state.get(f"mix_{group_slug}_{it['id']}", "")).strip()
+                mix_raw = str(it.get("mix", "")).strip()
+                if not mix_raw:
+                    mix_raw = str(st.session_state.get(f"mix_{group_slug}_{it['id']}", "")).strip()
                 counts, _err = parse_compact_mix(mix_raw)
                 block_total += sum(counts.values())
             st.caption(f"Subtotal blok '{group}': {block_total} pax")
@@ -1280,6 +1373,32 @@ def main() -> None:
                         st.rerun()
 
             group_items_map[group] = items
+            st.session_state[table_key] = items
+
+    if selected_groups:
+        all_sort_c1, _all_sort_c2 = st.columns([2, 10])
+        with all_sort_c1:
+            if st.button("Urut semua blok", type="secondary"):
+                for group in selected_groups:
+                    group_slug = slug(group)
+                    table_key = f"tasks_table_{group_slug}"
+                    items = st.session_state.get(table_key, [])
+                    if not isinstance(items, list) or not items:
+                        continue
+                    ranked = []
+                    total_len = len(items)
+                    for i, it in enumerate(items):
+                        task_id = str(it.get("id", ""))
+                        raw = str(st.session_state.get(f"ord_{group_slug}_{task_id}", i + 1)).strip()
+                        wanted = int(raw) if raw.isdigit() else (i + 1)
+                        if task_id == "__pic_report__":
+                            wanted = 0
+                        else:
+                            wanted = max(1, min(wanted, max(1, total_len)))
+                        ranked.append((wanted, i, it))
+                    ranked.sort(key=lambda x: (0 if str(x[2].get("id", "")) == "__pic_report__" else 1, x[0], x[1]))
+                    st.session_state[table_key] = [x[2] for x in ranked]
+                st.rerun()
 
     activity_rows, parse_errors = get_activity_rows(group_items_map)
     current_total = activity_total(activity_rows)
@@ -1327,8 +1446,8 @@ def main() -> None:
     st.caption(f"Total slot sebelumnya: {prev_text} | Delta sekarang: {delta_text}")
     if isinstance(prev, int) and current_total != prev:
         st.error(f"ALARM: total berubah dari {prev} ke {current_total} (delta {current_total - prev:+d}).")
-    move_in_raw = st.text_input("Mutasi masuk (opsional, contoh: 2gd+1k)", placeholder="contoh: 2gd")
-    move_out_raw = st.text_input("Mutasi keluar (opsional, contoh: 2gd)", placeholder="contoh: 2gd")
+    move_in_raw = st.text_input("Mutasi masuk (opsional, contoh: 2gd+1k)", placeholder="contoh: 2gd", key="move_in_raw")
+    move_out_raw = st.text_input("Mutasi keluar (opsional, contoh: 2gd)", placeholder="contoh: 2gd", key="move_out_raw")
     move_in_counts, move_in_err = parse_compact_mix(move_in_raw)
     move_out_counts, move_out_err = parse_compact_mix(move_out_raw)
     move_in_total = sum(move_in_counts.values())
@@ -1449,83 +1568,93 @@ def main() -> None:
 
     submitted = st.button("Kirim Telegram")
     if submitted:
-        current_rec = get_scope_record(work_date, team_id)
-        live_version = int(current_rec.get("version", 0))
-        live_lock = current_rec.get("lock")
-        if not isinstance(live_lock, dict) or live_lock.get("token") != st.session_state.get("lock_token"):
-            st.error("잠금 소유권이 없습니다. 다시 Buka Tim 또는 Take Over 후 시도하세요.")
+        if st.session_state.get("_submitting"):
+            st.warning("Sedang diproses. Mohon tunggu sebentar.")
             return
-        # If lock token is ours, accept latest live version to avoid false conflict blocks.
-        session_ver = st.session_state.get("scope_version")
-        if session_ver is not None and live_version != int(session_ver):
-            st.session_state["scope_version"] = live_version
+        st.session_state["_submitting"] = True
+        try:
+            current_rec = get_scope_record(work_date, team_id)
+            live_version = int(current_rec.get("version", 0))
+            live_lock = current_rec.get("lock")
+            if not isinstance(live_lock, dict) or live_lock.get("token") != st.session_state.get("lock_token"):
+                st.error("Anda tidak memegang kunci. Buka Tim atau Take Over Tim lalu coba lagi.")
+                return
+            # If lock token is ours, accept latest live version to avoid false conflict blocks.
+            session_ver = st.session_state.get("scope_version")
+            if session_ver is not None and live_version != int(session_ver):
+                st.session_state["scope_version"] = live_version
 
-        errors = validate(payload)
-        if errors:
-            st.error(errors[0])
-            return
+            errors = validate(payload)
+            if errors:
+                st.error(errors[0])
+                return
 
-        st.session_state.submission_id = payload["idempotency_key"]
-        st.session_state.previous_total = current_total
-        st.session_state.slot_history = active_part["history"]
-        persist_state_to_disk()
-
-        root_message_id = st.session_state.telegram_root_message_id
-        if root_message_id and len(preview_parts) == 1:
-            ok, msg = edit_existing_message(root_message_id, preview_text)
-            if not ok:
-                m = msg.lower()
-                if "message is not modified" in m:
-                    st.info("Konten sama dengan pesan sebelumnya. Tidak ada edit baru.")
-                elif ("message to edit not found" in m) or ("can't be edited" in m) or ("message can't be edited" in m):
-                    # Fallback: if edit target is gone/uneditable, send as a new message and relink root.
-                    ok_new, msg_new, message_id_new = send_new_message(preview_text)
-                    if not ok_new:
+            root_message_id = st.session_state.telegram_root_message_id
+            if root_message_id and len(preview_parts) == 1:
+                ok, msg = edit_existing_message(root_message_id, preview_text)
+                if not ok:
+                    m = msg.lower()
+                    if "message is not modified" in m:
+                        st.info("Konten sama dengan pesan sebelumnya. Tidak ada edit baru.")
+                    elif ("message to edit not found" in m) or ("can't be edited" in m) or ("message can't be edited" in m):
+                        # Fallback: if edit target is gone/uneditable, send as a new message and relink root.
+                        ok_new, msg_new, message_id_new = send_new_message(preview_text)
+                        if not ok_new:
+                            st.error(msg)
+                            return
+                        st.session_state.telegram_root_message_id = message_id_new
+                        st.warning("Pesan lama tidak bisa di-edit. Dikirim sebagai pesan baru.")
+                        st.success(f"{msg_new} (message_id={message_id_new})")
+                        st.session_state.submission_id = payload["idempotency_key"]
+                        st.session_state.previous_total = current_total
+                        st.session_state.slot_history = preview_history
+                        persist_state_to_disk()
+                        row = build_sheet_row(payload, current_total)
+                        sheet_state, msg_sheet = append_sheet_backup(payload, row)
+                        if sheet_state == "ok":
+                            st.caption("Sheets backup: OK")
+                        elif sheet_state == "error":
+                            st.warning(msg_sheet)
+                        else:
+                            st.caption(msg_sheet)
+                        st.caption(f"Idempotency Key: {payload['idempotency_key']}")
+                        return
+                    else:
                         st.error(msg)
                         return
-                    st.session_state.telegram_root_message_id = message_id_new
-                    st.warning("Pesan lama tidak bisa di-edit. Dikirim sebagai pesan baru.")
-                    st.success(f"{msg_new} (message_id={message_id_new})")
-                    persist_state_to_disk()
-                    row = build_sheet_row(payload, current_total)
-                    sheet_state, msg_sheet = append_sheet_backup(payload, row)
-                    if sheet_state == "ok":
-                        st.caption("Sheets backup: OK")
-                    elif sheet_state == "error":
-                        st.warning(msg_sheet)
-                    else:
-                        st.caption(msg_sheet)
-                    st.caption(f"Idempotency Key: {payload['idempotency_key']}")
-                    return
-                else:
+                ok_reply, msg_reply = send_update_reply(root_message_id)
+                if not ok_reply:
+                    st.warning(f"Pesan terupdate, tapi reply gagal: {msg_reply}")
+                st.success("Pesan Telegram berhasil diperbarui dan update reply sudah diproses")
+            else:
+                ok, msg, message_id = send_new_message(preview_text)
+                if not ok:
                     st.error(msg)
                     return
-            ok_reply, msg_reply = send_update_reply(root_message_id)
-            if not ok_reply:
-                st.warning(f"Pesan terupdate, tapi reply gagal: {msg_reply}")
-            st.success("Telegram 메시지 수정 완료 + update reply 처리")
-        else:
-            ok, msg, message_id = send_new_message(preview_text)
-            if not ok:
-                st.error(msg)
-                return
-            st.session_state.telegram_root_message_id = message_id
-            if root_message_id and len(preview_parts) > 1:
-                st.warning(
-                    "Batas panjang tercapai. Laporan dilanjutkan sebagai pesan baru "
-                    f"(part {active_part['part_no']})."
-                )
-            st.success(f"{msg} (message_id={message_id})")
+                st.session_state.telegram_root_message_id = message_id
+                if root_message_id and len(preview_parts) > 1:
+                    st.warning(
+                        "Batas panjang tercapai. Laporan dilanjutkan sebagai pesan baru "
+                        f"(part {active_part['part_no']})."
+                    )
+                st.success(f"{msg} (message_id={message_id})")
 
-        row = build_sheet_row(payload, current_total)
-        sheet_state, msg_sheet = append_sheet_backup(payload, row)
-        if sheet_state == "ok":
-            st.caption("Sheets backup: OK")
-        elif sheet_state == "error":
-            st.warning(msg_sheet)
-        else:
-            st.caption(msg_sheet)
-        st.caption(f"Idempotency Key: {payload['idempotency_key']}")
+            st.session_state.submission_id = payload["idempotency_key"]
+            st.session_state.previous_total = current_total
+            st.session_state.slot_history = preview_history
+            persist_state_to_disk()
+
+            row = build_sheet_row(payload, current_total)
+            sheet_state, msg_sheet = append_sheet_backup(payload, row)
+            if sheet_state == "ok":
+                st.caption("Sheets backup: OK")
+            elif sheet_state == "error":
+                st.warning(msg_sheet)
+            else:
+                st.caption(msg_sheet)
+            st.caption(f"Idempotency Key: {payload['idempotency_key']}")
+        finally:
+            st.session_state["_submitting"] = False
 
     if st.button("Simpan draft lokal"):
         persist_state_to_disk()
@@ -1537,3 +1666,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

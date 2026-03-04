@@ -4,7 +4,6 @@ import re
 import secrets
 import threading
 import uuid
-from collections.abc import Mapping
 from html import escape
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -14,20 +13,19 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 
-COUNT_KEYS = ["k", "lpk", "cc", "pk", "dr", "st", "lain"]
+COUNT_KEYS = ["k", "lk", "c", "pk", "gd", "dr", "st"]
 TOKEN_RE = re.compile(r"^\s*(\d+)\s*([a-zA-Z]+)\s*$", re.IGNORECASE)
 TOKEN_ALIAS = {
     "k": "k",
-    "lpk": "lpk",
-    "lk": "lpk",
-    "cc": "cc",
-    "c": "cc",
+    "lk": "lk",
+    "c": "c",
+    "cc": "c",
     "pk": "pk",
+    "gd": "gd",
     "dr": "dr",
     "dry": "dr",
     "st": "st",
     "steam": "st",
-    "lain": "lain",
 }
 
 ACTIVITY_GROUP_TEMPLATES = {
@@ -38,23 +36,23 @@ ACTIVITY_GROUP_TEMPLATES = {
 }
 
 SOURCE_DEPARTMENTS = [
-    ("packing", "Packing"),
-    ("kupas", "Kupas"),
-    ("dry", "Dry"),
+    ("kupas", "Inbound"),
     ("gudang", "Gudang"),
-    ("cuci", "Cuci"),
+    ("dry", "Dry"),
     ("steam", "Steam"),
+    ("cuci", "Cuci"),
+    ("packing", "Packing"),
     ("lain", "Lain-lain"),
 ]
 
 PERSIST_PATH = Path(".laporan_situasi_state.json")
-STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "ord_", "tasks_table_", "task_name_", "pic_name_", "pic_role_", "pic_mode_")
+STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "tasks_table_", "task_name_", "pic_name_", "pic_role_")
 LOCK_TTL_SECONDS = 600
 STATE_IO_LOCK = threading.RLock()
 TEAM_LABELS = {
-    "PACKING-1": "Team Vivi",
-    "PACKING-2": "Team 2",
-    "PACKING-3": "Team 3",
+    "PACKING-1": "Packing Team 1",
+    "PACKING-2": "Packing Team 2",
+    "PACKING-3": "Packing Team 3",
 }
 TELEGRAM_SOFT_LIMIT = 3200
 
@@ -117,26 +115,17 @@ def pretty_label(text: str) -> str:
 
 
 def load_team_passwords() -> dict[str, str]:
-    # Priority:
-    # 1) Streamlit secrets [TEAM_PASSWORDS]
-    # 2) TEAM_PASSWORDS_JSON from secrets/env
-    # 3) per-team TEAM_PIN_* from secrets/env
+    # Priority: Streamlit secrets -> TEAM_PASSWORDS_JSON -> per-team env vars.
     out: dict[str, str] = {}
     try:
         secret_map = st.secrets.get("TEAM_PASSWORDS", {})
-        if isinstance(secret_map, Mapping):
+        if isinstance(secret_map, dict):
             out = {str(k).strip(): str(v).strip() for k, v in secret_map.items() if str(k).strip() and str(v).strip()}
     except Exception:
         out = {}
 
     if not out:
-        raw_json = ""
-        try:
-            raw_json = str(st.secrets.get("TEAM_PASSWORDS_JSON", "")).strip()
-        except Exception:
-            raw_json = ""
-        if not raw_json:
-            raw_json = os.getenv("TEAM_PASSWORDS_JSON", "").strip()
+        raw_json = os.getenv("TEAM_PASSWORDS_JSON", "").strip()
         if raw_json:
             try:
                 loaded = json.loads(raw_json)
@@ -148,56 +137,10 @@ def load_team_passwords() -> dict[str, str]:
     if not out:
         for team_id in TEAM_LABELS.keys():
             env_key = f"TEAM_PIN_{team_id.replace('-', '_')}"
-            pin = ""
-            try:
-                pin = str(st.secrets.get(env_key, "")).strip()
-            except Exception:
-                pin = ""
-            if not pin:
-                pin = os.getenv(env_key, "").strip()
+            pin = os.getenv(env_key, "").strip()
             if pin:
                 out[team_id] = pin
-    if not out:
-        # Fallback default for packing app so operations can continue
-        # even when Cloud secrets/env has not been configured yet.
-        out = {
-            "PACKING-1": "3456",
-            "PACKING-2": "qwer",
-            "PACKING-3": "qw34",
-        }
     return out
-
-
-def get_config_value(
-    key: str,
-    default: str = "",
-    aliases: list[str] | None = None,
-    nested_paths: list[tuple[str, str]] | None = None,
-) -> str:
-    lookup_keys = [key] + (aliases or [])
-    for k in lookup_keys:
-        env_val = os.getenv(k, "").strip()
-        if env_val:
-            return env_val
-
-    try:
-        for k in lookup_keys:
-            secret_val = st.secrets.get(k, "")
-            if secret_val is not None:
-                secret_text = str(secret_val).strip()
-                if secret_text:
-                    return secret_text
-        for path in (nested_paths or []):
-            sec_name, field_name = path
-            sec_obj = st.secrets.get(sec_name, {})
-            if isinstance(sec_obj, Mapping):
-                nested_val = sec_obj.get(field_name, "")
-                nested_text = str(nested_val).strip()
-                if nested_text:
-                    return nested_text
-    except Exception:
-        return default
-    return default
 
 
 def load_persisted_state() -> dict:
@@ -444,14 +387,6 @@ def _hhmm_to_minutes(hhmm: str) -> int:
         return 0
 
 
-def normalize_hhmm(raw: str, fallback: str) -> tuple[str, bool]:
-    val = str(raw or "").strip()
-    m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", val)
-    if not m:
-        return fallback, False
-    return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}", True
-
-
 def build_slots(start_hhmm: str = "00:00", end_hhmm: str = "23:30") -> list[str]:
     start = _hhmm_to_minutes(start_hhmm)
     end = _hhmm_to_minutes(end_hhmm)
@@ -603,7 +538,7 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
 
     lines: list[str] = [
         f"3-{slot_idx}) {report_time}",
-        f"   Total waktu laporan: {slot_item['slot_total']} pax",
+        f"   Total slot: {slot_item['slot_total']} pax",
         f"   Sumber: {sumber_line}",
     ]
 
@@ -639,15 +574,15 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
 
     event_lines = split_note_lines(slot_item.get("event_slot", ""))
     if event_lines and (event_lines != reason_lines):
-        lines.append(f"   Keterangan tambahan: {event_lines[0]}")
+        lines.append(f"   Event slot ini: {event_lines[0]}")
         for extra in event_lines[1:]:
             lines.append(f"                 - {extra}")
 
-    lines.append(f"   Total semua aktivitas pada waktu laporan ini: {slot_item['slot_total']} pax")
+    lines.append(f"   Total semua aktivitas slot ini: {slot_item['slot_total']} pax")
     return lines
 
 
-def render_activity_summary_table(rows: list[dict], group_pic_map: dict[str, dict] | None = None) -> None:
+def render_activity_summary_table(rows: list[dict]) -> None:
     if not rows:
         return
     grouped: dict[str, list[dict]] = {}
@@ -658,27 +593,17 @@ def render_activity_summary_table(rows: list[dict], group_pic_map: dict[str, dic
     group_names = list(grouped.keys())
     for gi, group in enumerate(group_names):
         items = grouped[group]
-        pic_text = "-"
-        if isinstance(group_pic_map, dict):
-            pic = group_pic_map.get(group, {})
-            if isinstance(pic, dict):
-                pic_name = str(pic.get("name", "")).strip()
-                pic_role = str(pic.get("role", "")).strip()
-                merged = " / ".join(x for x in [pic_name, pic_role] if x)
-                if merged:
-                    pic_text = merged
         for ri, row in enumerate(items):
             cells: list[str] = []
             if ri == 0:
                 cells.append(f"<td rowspan='{len(items)}'>{escape(group)}</td>")
-                cells.append(f"<td rowspan='{len(items)}'>{escape(pic_text)}</td>")
             cells.append(f"<td>{escape(str(row.get('task', '-')))}</td>")
             cells.append(f"<td>{escape(format_activity_line(row))}</td>")
             subtotal = sum(int(row.get(k, 0)) for k in COUNT_KEYS)
             cells.append(f"<td style='text-align:right'>{subtotal}</td>")
             html_rows.append("<tr>" + "".join(cells) + "</tr>")
         if gi < len(group_names) - 1:
-            html_rows.append("<tr class='grp-gap'><td colspan='5'></td></tr>")
+            html_rows.append("<tr class='grp-gap'><td colspan='4'></td></tr>")
 
     table_html = """
     <style>
@@ -690,7 +615,7 @@ def render_activity_summary_table(rows: list[dict], group_pic_map: dict[str, dic
     <table class="activity-summary">
       <thead>
         <tr>
-          <th>Group</th><th>PIC / Jabatan</th><th>Aktivitas</th><th>Rincian</th><th>Subtotal</th>
+          <th>Group</th><th>Aktivitas</th><th>Rincian</th><th>Subtotal</th>
         </tr>
       </thead>
       <tbody>
@@ -769,20 +694,14 @@ def validate(payload: dict) -> list[str]:
 
 def _telegram_head_lines(payload: dict) -> list[str]:
     team_label = TEAM_LABELS.get(payload["team_id"], payload["team_id"])
-    reporter_upper = pretty_label(payload["reporter"]).upper()
-    shift_upper = str(payload["shift"]).upper()
-    team_label_upper = team_label.upper()
     return [
+        f"*{team_label.upper()} - SHIFT {str(payload['shift']).upper()}*",
+        f"*PELAPOR: {pretty_label(payload['reporter']).upper()}*",
+        "",
         "B-1-2 LAPORAN SITUASI PACKING (30 MENIT)",
-        f"PETUGAS LAPORAN: {reporter_upper}",
-        f"SHIFT: {shift_upper} | TIM: {team_label_upper}",
         "",
-        "================================",
-        "",
-        "Ringkasan Header",
-        "",
-        f"- Tim laporan: {team_label}",
-        f"- Shift: {payload['shift']}",
+        "*1) Header*",
+        f"- Tim laporan: {team_label} (Shift {payload['shift']})",
         f"- Tanggal kerja: {payload['work_date']}",
         f"- QC: {pretty_label(payload['qc_name'])}",
         f"- TL: {pretty_label(payload['tl_name'])}",
@@ -874,14 +793,9 @@ def build_sheet_row(payload: dict, current_total: int) -> list[str]:
 
 
 def append_sheet_backup(payload: dict, row: list[str]) -> tuple[str, str]:
-    webhook = get_config_value(
-        "GOOGLE_SHEETS_WEBHOOK_URL",
-        "",
-        aliases=["SHEETS_WEBHOOK_URL"],
-        nested_paths=[("GOOGLE_SHEETS", "WEBHOOK_URL"), ("sheets", "webhook_url")],
-    )
+    webhook = os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "").strip()
     if not webhook:
-        return "skip", "Sheets backup nonaktif (env/secrets belum diatur)"
+        return "skip", "Sheets backup nonaktif (variabel lingkungan belum diatur)"
     body = json.dumps(
         {
             "idempotency_key": payload.get("idempotency_key"),
@@ -909,14 +823,9 @@ def append_sheet_backup(payload: dict, row: list[str]) -> tuple[str, str]:
 
 
 def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
-    token = get_config_value(
-        "TELEGRAM_BOT_TOKEN",
-        "",
-        aliases=["BOT_TOKEN", "TELEGRAM_TOKEN"],
-        nested_paths=[("TELEGRAM", "BOT_TOKEN"), ("telegram", "bot_token"), ("telegram", "token")],
-    )
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        return False, "TELEGRAM_BOT_TOKEN belum diatur di env/secrets.", {}
+        return False, "Variabel lingkungan TELEGRAM_BOT_TOKEN belum diatur.", {}
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = parse.urlencode(payload).encode("utf-8")
     req = request.Request(url, data=data, method="POST")
@@ -944,14 +853,9 @@ def _escape_mdv2(text: str) -> str:
 
 
 def send_new_message(message: str) -> tuple[bool, str, int | None]:
-    chat_id = get_config_value(
-        "TELEGRAM_CHAT_ID",
-        "",
-        aliases=["CHAT_ID", "TELEGRAM_CHATID"],
-        nested_paths=[("TELEGRAM", "CHAT_ID"), ("telegram", "chat_id")],
-    )
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets.", None
+        return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur.", None
     message = _escape_mdv2(message)
     ok, msg, data = _telegram_api(
         "sendMessage",
@@ -963,14 +867,9 @@ def send_new_message(message: str) -> tuple[bool, str, int | None]:
 
 
 def edit_existing_message(message_id: int, message: str) -> tuple[bool, str]:
-    chat_id = get_config_value(
-        "TELEGRAM_CHAT_ID",
-        "",
-        aliases=["CHAT_ID", "TELEGRAM_CHATID"],
-        nested_paths=[("TELEGRAM", "CHAT_ID"), ("telegram", "chat_id")],
-    )
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets."
+        return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur."
     message = _escape_mdv2(message)
     ok, msg, _ = _telegram_api(
         "editMessageText",
@@ -982,14 +881,9 @@ def edit_existing_message(message_id: int, message: str) -> tuple[bool, str]:
 
 
 def send_update_reply(root_message_id: int) -> tuple[bool, str]:
-    chat_id = get_config_value(
-        "TELEGRAM_CHAT_ID",
-        "",
-        aliases=["CHAT_ID", "TELEGRAM_CHATID"],
-        nested_paths=[("TELEGRAM", "CHAT_ID"), ("telegram", "chat_id")],
-    )
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets."
+        return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur."
     ok, msg, _ = _telegram_api(
         "sendMessage",
         {
@@ -1170,29 +1064,8 @@ def main() -> None:
             value=datetime.strptime(default_end, "%H:%M").time(),
             key="work_end_time",
         )
-    slot_start_auto = f"{work_start.hour:02d}:{work_start.minute:02d}"
-    slot_end_auto = f"{work_end.hour:02d}:{work_end.minute:02d}"
-    tm1, tm2 = st.columns(2)
-    with tm1:
-        start_manual = st.text_input(
-            "Input manual jam mulai (HH:MM)",
-            value=slot_start_auto,
-            key="work_start_manual",
-            placeholder="contoh: 15:00",
-        )
-    with tm2:
-        end_manual = st.text_input(
-            "Input manual jam selesai (HH:MM)",
-            value=slot_end_auto,
-            key="work_end_manual",
-            placeholder="contoh: 23:30",
-        )
-    slot_start, start_ok = normalize_hhmm(start_manual, slot_start_auto)
-    slot_end, end_ok = normalize_hhmm(end_manual, slot_end_auto)
-    if not start_ok:
-        st.error("Jam kerja mulai tidak valid. Gunakan format HH:MM (contoh 15:00).")
-    if not end_ok:
-        st.error("Jam kerja selesai tidak valid. Gunakan format HH:MM (contoh 23:30).")
+    slot_start = f"{work_start.hour:02d}:{work_start.minute:02d}"
+    slot_end = f"{work_end.hour:02d}:{work_end.minute:02d}"
     slots = build_slots(slot_start, slot_end)
     suggested_slot = current_slot()
     if suggested_slot not in slots:
@@ -1227,8 +1100,8 @@ def main() -> None:
         with col_f:
             checker_packing = st.text_input("Cross cek packing", placeholder="Nama petugas", key="checker_packing")
 
-    st.subheader("2) Detail Kerjaan")
-    st.caption(f"Waktu laporan aktif: {report_slot}")
+    st.subheader("2) Detail Aktivitas + Keterangan")
+    st.caption(f"Slot laporan aktif: {report_slot}")
     # Reset only when slot actually changes during an active session.
     # On first load / take over, keep restored values from persisted state.
     if "_last_slot_form_reset" not in st.session_state:
@@ -1268,12 +1141,11 @@ def main() -> None:
             )
     source_sum_now = sum(int(source_composition[k]) for k, _ in SOURCE_DEPARTMENTS)
     st.caption(f"Total komposisi sumber: {source_sum_now} pax")
-    st.caption("Singkatan: pk=Packing, lpk=packing laki-laki, k=Kupas, lk=Laki-laki, cc=Cuci, dr=Dry, st=Steam, lain=Lain.")
-    st.caption("Contoh input: 10pk, 2lpk")
+    st.caption("Singkatan: k=Inbound, lk=Line packing, c=Cuci, pk=Packing, gd=Gudang, dr=Dry, st=Steam. Contoh input: 3k+2pk")
     if "manual_groups" not in st.session_state:
         st.session_state["manual_groups"] = []
 
-    st.markdown("### 2-1) Pilih blok aktivitas")
+    st.markdown("**Pilih blok aktivitas**")
     g1, g2 = st.columns([8, 2])
     with g1:
         new_group_name = st.text_input(
@@ -1304,7 +1176,7 @@ def main() -> None:
 
         with st.expander(f"- {group}", expanded=True):
             st.caption("Flow manual: tambah seperlunya, tanpa default.")
-            pic_c1, pic_c2, pic_c3 = st.columns(3)
+            pic_c1, pic_c2 = st.columns(2)
             with pic_c1:
                 pic_name = st.text_input(
                     "PIC",
@@ -1317,12 +1189,6 @@ def main() -> None:
                     key=f"pic_role_{group_slug}",
                     placeholder="Jabatan PIC",
                 )
-            with pic_c3:
-                pic_mode = st.selectbox(
-                    "Status PIC",
-                    ["Laporan dan kerja", "Laporan tanpa kerja"],
-                    key=f"pic_mode_{group_slug}",
-                )
             group_pic_map[group] = {"name": pic_name, "role": pic_role}
             items = st.session_state[table_key]
             cleaned = []
@@ -1330,16 +1196,7 @@ def main() -> None:
                 if isinstance(item, dict) and item.get("id"):
                     name = str(item.get("tugas", "")).strip()
                     if name and name.lower() not in {"none", "-"}:
-                        item_id = str(item["id"])
-                        if item_id == "__pic_report__":
-                            continue
-                        mix_key = f"mix_{group_slug}_{item_id}"
-                        mix_value = str(st.session_state.get(mix_key, item.get("mix", ""))).strip()
-                        cleaned.append({"id": item_id, "tugas": name, "mix": mix_value})
-            pic_task_name = "PIC LAPORAN TANPA KERJA" if pic_mode == "Laporan tanpa kerja" else "PIC LAPORAN DAN KERJA"
-            pic_mix_key = f"mix_{group_slug}___pic_report__"
-            pic_mix_value = str(st.session_state.get(pic_mix_key, "")).strip()
-            cleaned.insert(0, {"id": "__pic_report__", "tugas": pic_task_name, "mix": pic_mix_value})
+                        cleaned.append({"id": str(item["id"]), "tugas": name})
             st.session_state[table_key] = cleaned
             items = cleaned
 
@@ -1365,45 +1222,35 @@ def main() -> None:
 
             for idx, item in enumerate(items):
                 task_id = item["id"]
-                row_no_display = "0" if task_id == "__pic_report__" else str(max(1, idx))
-                row_no, row_task, row_mix, row_del = st.columns([0.7, 4.8, 3.5, 1.2])
+                row_no, row_task, row_mix, row_del = st.columns([0.8, 1.8, 6.0, 1.4])
                 with row_no:
                     ord_key = f"ord_{group_slug}_{task_id}"
                     if ord_key not in st.session_state:
-                        st.session_state[ord_key] = row_no_display
+                        st.session_state[ord_key] = str(idx + 1)
                     st.text_input(
                         "No",
                         key=ord_key,
                         label_visibility="collapsed",
-                        disabled=(task_id == "__pic_report__"),
                     )
                 with row_task:
                     task_name_key = f"task_name_{group_slug}_{task_id}"
-                    if task_id == "__pic_report__":
-                        st.session_state[task_name_key] = pic_task_name
-                    elif task_name_key not in st.session_state:
+                    if task_name_key not in st.session_state:
                         st.session_state[task_name_key] = item["tugas"]
                     edited_name = st.text_input(
-                        f"Nama tugas {row_no_display}",
+                        f"Nama tugas {idx + 1}",
                         key=task_name_key,
                         label_visibility="collapsed",
-                        disabled=(task_id == "__pic_report__"),
                     ).strip()
-                    item["tugas"] = pic_task_name if task_id == "__pic_report__" else edited_name
+                    item["tugas"] = edited_name
                 with row_mix:
-                    mix_key = f"mix_{group_slug}_{task_id}"
-                    if mix_key not in st.session_state and str(item.get("mix", "")).strip():
-                        st.session_state[mix_key] = str(item.get("mix", "")).strip()
-                    mix_value = st.text_input(
-                        f"Rincian {row_no_display}",
-                        key=mix_key,
-                        placeholder=("contoh: 1k / 1pk / 2dr" if task_id == "__pic_report__" else "contoh: 10pk, 2lpk"),
+                    st.text_input(
+                        f"Rincian {idx + 1}",
+                        key=f"mix_{group_slug}_{task_id}",
+                        placeholder="contoh: 3k+2gd",
                         label_visibility="collapsed",
-                        disabled=False,
                     )
-                    item["mix"] = str(mix_value).strip()
                 with row_del:
-                    if task_id != "__pic_report__" and st.button("Hapus", key=f"del_{group_slug}_{task_id}", type="secondary"):
+                    if st.button("Hapus", key=f"del_{group_slug}_{task_id}", type="secondary"):
                         st.session_state["confirm_remove_task"] = f"{group_slug}:{task_id}"
                 if st.session_state.get("confirm_remove_task") == f"{group_slug}:{task_id}":
                     st.warning("Hapus baris tugas ini?")
@@ -1431,17 +1278,14 @@ def main() -> None:
                     for i, it in enumerate(items):
                         raw = str(st.session_state.get(f"ord_{group_slug}_{it['id']}", i + 1)).strip()
                         wanted = int(raw) if raw.isdigit() else (i + 1)
-                        wanted = max(0, min(wanted, max(1, total_len)))
+                        wanted = max(1, min(wanted, max(1, total_len)))
                         ranked.append((wanted, i, it))
                     ranked.sort(key=lambda x: (x[0], x[1]))
-                    ranked = sorted(ranked, key=lambda x: (0 if x[2]["id"] == "__pic_report__" else 1, x[0], x[1]))
                     st.session_state[table_key] = [x[2] for x in ranked]
                     st.rerun()
             block_total = 0
             for it in items:
-                mix_raw = str(it.get("mix", "")).strip()
-                if not mix_raw:
-                    mix_raw = str(st.session_state.get(f"mix_{group_slug}_{it['id']}", "")).strip()
+                mix_raw = str(st.session_state.get(f"mix_{group_slug}_{it['id']}", "")).strip()
                 counts, _err = parse_compact_mix(mix_raw)
                 block_total += sum(counts.values())
             st.caption(f"Subtotal blok '{group}': {block_total} pax")
@@ -1463,32 +1307,6 @@ def main() -> None:
                         st.rerun()
 
             group_items_map[group] = items
-            st.session_state[table_key] = items
-
-    if selected_groups:
-        all_sort_c1, _all_sort_c2 = st.columns([2, 10])
-        with all_sort_c1:
-            if st.button("Urut semua blok", type="secondary"):
-                for group in selected_groups:
-                    group_slug = slug(group)
-                    table_key = f"tasks_table_{group_slug}"
-                    items = st.session_state.get(table_key, [])
-                    if not isinstance(items, list) or not items:
-                        continue
-                    ranked = []
-                    total_len = len(items)
-                    for i, it in enumerate(items):
-                        task_id = str(it.get("id", ""))
-                        raw = str(st.session_state.get(f"ord_{group_slug}_{task_id}", i + 1)).strip()
-                        wanted = int(raw) if raw.isdigit() else (i + 1)
-                        if task_id == "__pic_report__":
-                            wanted = 0
-                        else:
-                            wanted = max(1, min(wanted, max(1, total_len)))
-                        ranked.append((wanted, i, it))
-                    ranked.sort(key=lambda x: (0 if str(x[2].get("id", "")) == "__pic_report__" else 1, x[0], x[1]))
-                    st.session_state[table_key] = [x[2] for x in ranked]
-                st.rerun()
 
     activity_rows, parse_errors = get_activity_rows(group_items_map)
     current_total = activity_total(activity_rows)
@@ -1508,7 +1326,7 @@ def main() -> None:
         st.error("ALARM: total slot berbeda dengan laporan sebelumnya. Wajib cek penyebab.")
 
     if activity_rows:
-        render_activity_summary_table(activity_rows, group_pic_map)
+        render_activity_summary_table(activity_rows)
     if parse_errors:
         st.warning(parse_errors[0])
 
@@ -1531,26 +1349,7 @@ def main() -> None:
     if source_sum_now != int(current_total_people):
         st.error("Total komposisi sumber tidak sama dengan Total orang per saat ini.")
 
-    issue_rows: list[str] = []
-    if parse_errors:
-        issue_rows.append(parse_errors[0])
-    if int(current_total_people) != current_total:
-        issue_rows.append("Total orang per saat ini != subtotal aktivitas.")
-    if source_sum_now != int(current_total_people):
-        issue_rows.append("Total komposisi sumber != total orang per saat ini.")
-    if move_in_err:
-        issue_rows.append(f"Mutasi masuk: {move_in_err}")
-    if move_out_err:
-        issue_rows.append(f"Mutasi keluar: {move_out_err}")
-    if isinstance(prev, int) and current_total != prev:
-        if not str(st.session_state.get("change_reason", "")).strip():
-            issue_rows.append("Isi penyebab perubahan personel.")
-        if str(st.session_state.get("tl_confirm", "")).strip().lower() != "sudah cek":
-            issue_rows.append("Konfirmasi TL harus tepat: sudah cek.")
-    if issue_rows:
-        st.error("Masalah yang perlu diperbaiki:\n- " + "\n- ".join(issue_rows))
-
-    st.markdown("### 2-2) Analisis Perubahan Total (untuk TL)")
+    st.markdown("**Analisa Perubahan Total (untuk TL)**")
     prev_text = "N/A" if prev is None else f"{prev} pax"
     st.caption(f"Total slot sebelumnya: {prev_text} | Delta sekarang: {delta_text}")
     if isinstance(prev, int) and current_total != prev:
@@ -1587,11 +1386,10 @@ def main() -> None:
             key="tl_confirm",
         )
 
-    st.markdown("### 3) Keterangan")
     event_slot = st.text_area(
-        "Keterangan tambahan (opsional)",
+        "Event slot ini (opsional)",
         height=80,
-        placeholder="Contoh: Listrik padam, kerja berhenti sementara.",
+        placeholder="Contoh: 1 orang izin pulang sebentar: Mike / Shift tengah datang 3 pax.",
         key="event_slot",
     )
 
@@ -1696,7 +1494,7 @@ def main() -> None:
 
             errors = validate(payload)
             if errors:
-                st.error("Validasi gagal:\n- " + "\n- ".join(errors))
+                st.error(errors[0])
                 return
 
             root_message_id = st.session_state.telegram_root_message_id

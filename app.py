@@ -37,17 +37,17 @@ ACTIVITY_GROUP_TEMPLATES = {
 }
 
 SOURCE_DEPARTMENTS = [
-    ("kupas", "Inbound"),
-    ("gudang", "Gudang"),
-    ("dry", "Dry"),
-    ("steam", "Steam"),
-    ("cuci", "Cuci"),
     ("packing", "Packing"),
+    ("kupas", "Kupas"),
+    ("dry", "Dry"),
+    ("gudang", "Gudang"),
+    ("cuci", "Cuci"),
+    ("steam", "Steam"),
     ("lain", "Lain-lain"),
 ]
 
 PERSIST_PATH = Path(".laporan_situasi_state.json")
-STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "tasks_table_", "task_name_", "pic_name_", "pic_role_")
+STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "ord_", "tasks_table_", "task_name_", "pic_name_", "pic_role_", "pic_mode_")
 LOCK_TTL_SECONDS = 600
 STATE_IO_LOCK = threading.RLock()
 TEAM_LABELS = {
@@ -575,7 +575,7 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
 
     event_lines = split_note_lines(slot_item.get("event_slot", ""))
     if event_lines and (event_lines != reason_lines):
-        lines.append(f"   Event slot ini: {event_lines[0]}")
+        lines.append(f"   Keterangan tambahan: {event_lines[0]}")
         for extra in event_lines[1:]:
             lines.append(f"                 - {extra}")
 
@@ -923,6 +923,7 @@ def sync_scope_if_needed(work_date: str, team_id: str) -> None:
         st.session_state["slot_history"] = []
         st.session_state["current_total_people"] = 0
         st.session_state["selected_departments"] = []
+        st.session_state["manual_groups"] = list(ACTIVITY_GROUP_TEMPLATES.keys())
         st.session_state["change_reason"] = ""
         st.session_state["tl_confirm"] = ""
         st.session_state["move_in_raw"] = ""
@@ -1142,9 +1143,11 @@ def main() -> None:
             )
     source_sum_now = sum(int(source_composition[k]) for k, _ in SOURCE_DEPARTMENTS)
     st.caption(f"Total komposisi sumber: {source_sum_now} pax")
-    st.caption("Singkatan: k=Inbound, lk=Line packing, c=Cuci, pk=Packing, gd=Gudang, dr=Dry, st=Steam. Contoh input: 3k+2pk")
+    st.caption("Singkatan: k=Kupas, lk=Line packing, c=Cuci, pk=Packing, gd=Gudang, dr=Dry, st=Steam. Contoh input: 3k+2pk")
     if "manual_groups" not in st.session_state:
         st.session_state["manual_groups"] = []
+    if not st.session_state["manual_groups"]:
+        st.session_state["manual_groups"] = list(ACTIVITY_GROUP_TEMPLATES.keys())
 
     st.markdown("**Pilih blok aktivitas**")
     g1, g2 = st.columns([8, 2])
@@ -1173,7 +1176,8 @@ def main() -> None:
         group_slug = slug(group)
         table_key = f"tasks_table_{group_slug}"
         if table_key not in st.session_state or not isinstance(st.session_state.get(table_key), list):
-            st.session_state[table_key] = []
+            defaults = ACTIVITY_GROUP_TEMPLATES.get(group, [])
+            st.session_state[table_key] = [_new_task_item(task_name) for task_name in defaults]
 
         with st.expander(f"- {group}", expanded=True):
             st.caption("Flow manual: tambah seperlunya, tanpa default.")
@@ -1387,9 +1391,10 @@ def main() -> None:
             key="tl_confirm",
         )
 
+    st.markdown("**3) Keterangan**")
     event_slot = st.text_area(
-        "Event slot ini (opsional)",
-        height=80,
+        "Keterangan tambahan (opsional)",
+        height=120,
         placeholder="Contoh: 1 orang izin pulang sebentar: Mike / Shift tengah datang 3 pax.",
         key="event_slot",
     )

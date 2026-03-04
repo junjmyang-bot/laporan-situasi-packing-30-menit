@@ -37,12 +37,12 @@ ACTIVITY_GROUP_TEMPLATES = {
 }
 
 SOURCE_DEPARTMENTS = [
-    ("kupas", "Inbound"),
-    ("gudang", "Gudang"),
-    ("dry", "Dry"),
-    ("steam", "Steam"),
-    ("cuci", "Cuci"),
     ("packing", "Packing"),
+    ("kupas", "Kupas"),
+    ("dry", "Dry"),
+    ("gudang", "Gudang"),
+    ("cuci", "Cuci"),
+    ("steam", "Steam"),
     ("lain", "Lain-lain"),
 ]
 
@@ -620,7 +620,7 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
     return lines
 
 
-def render_activity_summary_table(rows: list[dict]) -> None:
+def render_activity_summary_table(rows: list[dict], group_pic_map: dict[str, dict] | None = None) -> None:
     if not rows:
         return
     grouped: dict[str, list[dict]] = {}
@@ -631,17 +631,27 @@ def render_activity_summary_table(rows: list[dict]) -> None:
     group_names = list(grouped.keys())
     for gi, group in enumerate(group_names):
         items = grouped[group]
+        pic_text = "-"
+        if isinstance(group_pic_map, dict):
+            pic = group_pic_map.get(group, {})
+            if isinstance(pic, dict):
+                pic_name = str(pic.get("name", "")).strip()
+                pic_role = str(pic.get("role", "")).strip()
+                merged = " / ".join(x for x in [pic_name, pic_role] if x)
+                if merged:
+                    pic_text = merged
         for ri, row in enumerate(items):
             cells: list[str] = []
             if ri == 0:
                 cells.append(f"<td rowspan='{len(items)}'>{escape(group)}</td>")
+                cells.append(f"<td rowspan='{len(items)}'>{escape(pic_text)}</td>")
             cells.append(f"<td>{escape(str(row.get('task', '-')))}</td>")
             cells.append(f"<td>{escape(format_activity_line(row))}</td>")
             subtotal = sum(int(row.get(k, 0)) for k in COUNT_KEYS)
             cells.append(f"<td style='text-align:right'>{subtotal}</td>")
             html_rows.append("<tr>" + "".join(cells) + "</tr>")
         if gi < len(group_names) - 1:
-            html_rows.append("<tr class='grp-gap'><td colspan='4'></td></tr>")
+            html_rows.append("<tr class='grp-gap'><td colspan='5'></td></tr>")
 
     table_html = """
     <style>
@@ -653,7 +663,7 @@ def render_activity_summary_table(rows: list[dict]) -> None:
     <table class="activity-summary">
       <thead>
         <tr>
-          <th>Group</th><th>Aktivitas</th><th>Rincian</th><th>Subtotal</th>
+          <th>Group</th><th>PIC / Jabatan</th><th>Aktivitas</th><th>Rincian</th><th>Subtotal</th>
         </tr>
       </thead>
       <tbody>
@@ -1138,8 +1148,8 @@ def main() -> None:
         with col_f:
             checker_packing = st.text_input("Cross cek packing", placeholder="Nama petugas", key="checker_packing")
 
-    st.subheader("2) Detail Aktivitas + Keterangan")
-    st.caption(f"Slot laporan aktif: {report_slot}")
+    st.subheader("2) Detail Kerjaan")
+    st.caption(f"Waktu laporan aktif: {report_slot}")
     # Reset only when slot actually changes during an active session.
     # On first load / take over, keep restored values from persisted state.
     if "_last_slot_form_reset" not in st.session_state:
@@ -1179,11 +1189,12 @@ def main() -> None:
             )
     source_sum_now = sum(int(source_composition[k]) for k, _ in SOURCE_DEPARTMENTS)
     st.caption(f"Total komposisi sumber: {source_sum_now} pax")
-    st.caption("Singkatan: pk=Packing, lpk=packing laki-laki, k=Kupas, lk=Laki-laki, cc=Cuci, dr=Dry, st=Steam, lain=Lain. Contoh input: 10pk, 2lpk")
+    st.caption("Singkatan: pk=Packing, lpk=packing laki-laki, k=Kupas, lk=Laki-laki, cc=Cuci, dr=Dry, st=Steam, lain=Lain.")
+    st.caption("Contoh input: 10pk, 2lpk")
     if "manual_groups" not in st.session_state:
         st.session_state["manual_groups"] = []
 
-    st.markdown("**Pilih blok aktivitas**")
+    st.markdown("### 2-1) Pilih blok aktivitas")
     g1, g2 = st.columns([8, 2])
     with g1:
         new_group_name = st.text_input(
@@ -1418,7 +1429,7 @@ def main() -> None:
         st.error("ALARM: total slot berbeda dengan laporan sebelumnya. Wajib cek penyebab.")
 
     if activity_rows:
-        render_activity_summary_table(activity_rows)
+        render_activity_summary_table(activity_rows, group_pic_map)
     if parse_errors:
         st.warning(parse_errors[0])
 
@@ -1441,7 +1452,7 @@ def main() -> None:
     if source_sum_now != int(current_total_people):
         st.error("Total komposisi sumber tidak sama dengan Total orang per saat ini.")
 
-    st.markdown("**Analisa Perubahan Total (untuk TL)**")
+    st.markdown("### 2-2) Analisis Perubahan Total (untuk TL)")
     prev_text = "N/A" if prev is None else f"{prev} pax"
     st.caption(f"Total slot sebelumnya: {prev_text} | Delta sekarang: {delta_text}")
     if isinstance(prev, int) and current_total != prev:
@@ -1478,10 +1489,11 @@ def main() -> None:
             key="tl_confirm",
         )
 
+    st.markdown("### 3) Keterangan")
     event_slot = st.text_area(
-        "Event slot ini (opsional)",
+        "Keterangan tambahan (opsional)",
         height=80,
-        placeholder="Contoh: 1 orang izin pulang sebentar: Mike / Shift tengah datang 3 pax.",
+        placeholder="Contoh: Listrik padam, kerja berhenti sementara.",
         key="event_slot",
     )
 

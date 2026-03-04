@@ -167,18 +167,36 @@ def load_team_passwords() -> dict[str, str]:
     return out
 
 
-def get_config_value(key: str, default: str = "") -> str:
-    env_val = os.getenv(key, "").strip()
-    if env_val:
-        return env_val
+def get_config_value(
+    key: str,
+    default: str = "",
+    aliases: list[str] | None = None,
+    nested_paths: list[tuple[str, str]] | None = None,
+) -> str:
+    lookup_keys = [key] + (aliases or [])
+    for k in lookup_keys:
+        env_val = os.getenv(k, "").strip()
+        if env_val:
+            return env_val
+
     try:
-        secret_val = st.secrets.get(key, "")
-        if secret_val is None:
-            return default
-        secret_text = str(secret_val).strip()
-        return secret_text if secret_text else default
+        for k in lookup_keys:
+            secret_val = st.secrets.get(k, "")
+            if secret_val is not None:
+                secret_text = str(secret_val).strip()
+                if secret_text:
+                    return secret_text
+        for path in (nested_paths or []):
+            sec_name, field_name = path
+            sec_obj = st.secrets.get(sec_name, {})
+            if isinstance(sec_obj, dict):
+                nested_val = sec_obj.get(field_name, "")
+                nested_text = str(nested_val).strip()
+                if nested_text:
+                    return nested_text
     except Exception:
         return default
+    return default
 
 
 def load_persisted_state() -> dict:
@@ -841,7 +859,12 @@ def build_sheet_row(payload: dict, current_total: int) -> list[str]:
 
 
 def append_sheet_backup(payload: dict, row: list[str]) -> tuple[str, str]:
-    webhook = get_config_value("GOOGLE_SHEETS_WEBHOOK_URL", "")
+    webhook = get_config_value(
+        "GOOGLE_SHEETS_WEBHOOK_URL",
+        "",
+        aliases=["SHEETS_WEBHOOK_URL"],
+        nested_paths=[("GOOGLE_SHEETS", "WEBHOOK_URL"), ("sheets", "webhook_url")],
+    )
     if not webhook:
         return "skip", "Sheets backup nonaktif (env/secrets belum diatur)"
     body = json.dumps(
@@ -871,7 +894,12 @@ def append_sheet_backup(payload: dict, row: list[str]) -> tuple[str, str]:
 
 
 def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
-    token = get_config_value("TELEGRAM_BOT_TOKEN", "")
+    token = get_config_value(
+        "TELEGRAM_BOT_TOKEN",
+        "",
+        aliases=["BOT_TOKEN", "TELEGRAM_TOKEN"],
+        nested_paths=[("TELEGRAM", "BOT_TOKEN"), ("telegram", "bot_token"), ("telegram", "token")],
+    )
     if not token:
         return False, "TELEGRAM_BOT_TOKEN belum diatur di env/secrets.", {}
     url = f"https://api.telegram.org/bot{token}/{method}"
@@ -901,7 +929,12 @@ def _escape_mdv2(text: str) -> str:
 
 
 def send_new_message(message: str) -> tuple[bool, str, int | None]:
-    chat_id = get_config_value("TELEGRAM_CHAT_ID", "")
+    chat_id = get_config_value(
+        "TELEGRAM_CHAT_ID",
+        "",
+        aliases=["CHAT_ID", "TELEGRAM_CHATID"],
+        nested_paths=[("TELEGRAM", "CHAT_ID"), ("telegram", "chat_id")],
+    )
     if not chat_id:
         return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets.", None
     message = _escape_mdv2(message)
@@ -915,7 +948,12 @@ def send_new_message(message: str) -> tuple[bool, str, int | None]:
 
 
 def edit_existing_message(message_id: int, message: str) -> tuple[bool, str]:
-    chat_id = get_config_value("TELEGRAM_CHAT_ID", "")
+    chat_id = get_config_value(
+        "TELEGRAM_CHAT_ID",
+        "",
+        aliases=["CHAT_ID", "TELEGRAM_CHATID"],
+        nested_paths=[("TELEGRAM", "CHAT_ID"), ("telegram", "chat_id")],
+    )
     if not chat_id:
         return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets."
     message = _escape_mdv2(message)
@@ -929,7 +967,12 @@ def edit_existing_message(message_id: int, message: str) -> tuple[bool, str]:
 
 
 def send_update_reply(root_message_id: int) -> tuple[bool, str]:
-    chat_id = get_config_value("TELEGRAM_CHAT_ID", "")
+    chat_id = get_config_value(
+        "TELEGRAM_CHAT_ID",
+        "",
+        aliases=["CHAT_ID", "TELEGRAM_CHATID"],
+        nested_paths=[("TELEGRAM", "CHAT_ID"), ("telegram", "chat_id")],
+    )
     if not chat_id:
         return False, "TELEGRAM_CHAT_ID belum diatur di env/secrets."
     ok, msg, _ = _telegram_api(

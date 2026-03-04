@@ -761,14 +761,19 @@ def validate(payload: dict) -> list[str]:
 
 def _telegram_head_lines(payload: dict) -> list[str]:
     team_label = TEAM_LABELS.get(payload["team_id"], payload["team_id"])
+    reporter_upper = pretty_label(payload["reporter"]).upper()
+    shift_upper = str(payload["shift"]).upper()
     return [
-        f"*{team_label.upper()} - SHIFT {str(payload['shift']).upper()}*",
-        f"*PELAPOR: {pretty_label(payload['reporter']).upper()}*",
+        "*B-1-2 LAPORAN SITUASI PACKING (30 MENIT)*",
+        f"*PETUGAS LAPORAN: {reporter_upper}*",
+        f"*SHIFT: {shift_upper} | TIM: {team_label.upper()}*",
         "",
-        "B-1-2 LAPORAN SITUASI PACKING (30 MENIT)",
+        "================================",
         "",
-        "*1) Header*",
-        f"- Tim laporan: {team_label} (Shift {payload['shift']})",
+        "*Ringkasan Header*",
+        "",
+        f"- Tim laporan: {team_label}",
+        f"- Shift: {payload['shift']}",
         f"- Tanggal kerja: {payload['work_date']}",
         f"- QC: {pretty_label(payload['qc_name'])}",
         f"- TL: {pretty_label(payload['tl_name'])}",

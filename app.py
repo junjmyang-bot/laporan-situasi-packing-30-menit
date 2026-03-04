@@ -763,14 +763,15 @@ def _telegram_head_lines(payload: dict) -> list[str]:
     team_label = TEAM_LABELS.get(payload["team_id"], payload["team_id"])
     reporter_upper = pretty_label(payload["reporter"]).upper()
     shift_upper = str(payload["shift"]).upper()
+    team_label_upper = team_label.upper()
     return [
-        "*B-1-2 LAPORAN SITUASI PACKING (30 MENIT)*",
-        f"*PETUGAS LAPORAN: {reporter_upper}*",
-        f"*SHIFT: {shift_upper} | TIM: {team_label.upper()}*",
+        "B-1-2 LAPORAN SITUASI PACKING (30 MENIT)",
+        f"PETUGAS LAPORAN: {reporter_upper}",
+        f"SHIFT: {shift_upper} | TIM: {team_label_upper}",
         "",
         "================================",
         "",
-        "*Ringkasan Header*",
+        "Ringkasan Header",
         "",
         f"- Tim laporan: {team_label}",
         f"- Shift: {payload['shift']}",

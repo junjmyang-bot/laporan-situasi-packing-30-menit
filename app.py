@@ -444,6 +444,14 @@ def _hhmm_to_minutes(hhmm: str) -> int:
         return 0
 
 
+def normalize_hhmm(raw: str, fallback: str) -> tuple[str, bool]:
+    val = str(raw or "").strip()
+    m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", val)
+    if not m:
+        return fallback, False
+    return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}", True
+
+
 def build_slots(start_hhmm: str = "00:00", end_hhmm: str = "23:30") -> list[str]:
     start = _hhmm_to_minutes(start_hhmm)
     end = _hhmm_to_minutes(end_hhmm)
@@ -1162,8 +1170,29 @@ def main() -> None:
             value=datetime.strptime(default_end, "%H:%M").time(),
             key="work_end_time",
         )
-    slot_start = f"{work_start.hour:02d}:{work_start.minute:02d}"
-    slot_end = f"{work_end.hour:02d}:{work_end.minute:02d}"
+    slot_start_auto = f"{work_start.hour:02d}:{work_start.minute:02d}"
+    slot_end_auto = f"{work_end.hour:02d}:{work_end.minute:02d}"
+    tm1, tm2 = st.columns(2)
+    with tm1:
+        start_manual = st.text_input(
+            "Input manual jam mulai (HH:MM)",
+            value=slot_start_auto,
+            key="work_start_manual",
+            placeholder="contoh: 15:00",
+        )
+    with tm2:
+        end_manual = st.text_input(
+            "Input manual jam selesai (HH:MM)",
+            value=slot_end_auto,
+            key="work_end_manual",
+            placeholder="contoh: 23:30",
+        )
+    slot_start, start_ok = normalize_hhmm(start_manual, slot_start_auto)
+    slot_end, end_ok = normalize_hhmm(end_manual, slot_end_auto)
+    if not start_ok:
+        st.error("Jam kerja mulai tidak valid. Gunakan format HH:MM (contoh 15:00).")
+    if not end_ok:
+        st.error("Jam kerja selesai tidak valid. Gunakan format HH:MM (contoh 23:30).")
     slots = build_slots(slot_start, slot_end)
     suggested_slot = current_slot()
     if suggested_slot not in slots:
@@ -1502,6 +1531,25 @@ def main() -> None:
     if source_sum_now != int(current_total_people):
         st.error("Total komposisi sumber tidak sama dengan Total orang per saat ini.")
 
+    issue_rows: list[str] = []
+    if parse_errors:
+        issue_rows.append(parse_errors[0])
+    if int(current_total_people) != current_total:
+        issue_rows.append("Total orang per saat ini != subtotal aktivitas.")
+    if source_sum_now != int(current_total_people):
+        issue_rows.append("Total komposisi sumber != total orang per saat ini.")
+    if move_in_err:
+        issue_rows.append(f"Mutasi masuk: {move_in_err}")
+    if move_out_err:
+        issue_rows.append(f"Mutasi keluar: {move_out_err}")
+    if isinstance(prev, int) and current_total != prev:
+        if not str(st.session_state.get("change_reason", "")).strip():
+            issue_rows.append("Isi penyebab perubahan personel.")
+        if str(st.session_state.get("tl_confirm", "")).strip().lower() != "sudah cek":
+            issue_rows.append("Konfirmasi TL harus tepat: sudah cek.")
+    if issue_rows:
+        st.error("Masalah yang perlu diperbaiki:\n- " + "\n- ".join(issue_rows))
+
     st.markdown("### 2-2) Analisis Perubahan Total (untuk TL)")
     prev_text = "N/A" if prev is None else f"{prev} pax"
     st.caption(f"Total slot sebelumnya: {prev_text} | Delta sekarang: {delta_text}")
@@ -1648,7 +1696,7 @@ def main() -> None:
 
             errors = validate(payload)
             if errors:
-                st.error(errors[0])
+                st.error("Validasi gagal:\n- " + "\n- ".join(errors))
                 return
 
             root_message_id = st.session_state.telegram_root_message_id

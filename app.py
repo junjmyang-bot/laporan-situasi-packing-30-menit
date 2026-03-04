@@ -4,6 +4,7 @@ import re
 import secrets
 import threading
 import uuid
+from collections.abc import Mapping
 from html import escape
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -119,7 +120,7 @@ def load_team_passwords() -> dict[str, str]:
     out: dict[str, str] = {}
     try:
         secret_map = st.secrets.get("TEAM_PASSWORDS", {})
-        if isinstance(secret_map, dict):
+        if isinstance(secret_map, Mapping):
             out = {str(k).strip(): str(v).strip() for k, v in secret_map.items() if str(k).strip() and str(v).strip()}
     except Exception:
         out = {}
